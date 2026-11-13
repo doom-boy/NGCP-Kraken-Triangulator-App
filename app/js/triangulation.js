@@ -20,6 +20,11 @@ const Triangulation = (() => {
     const RAD2DEG = 180 / Math.PI;
     const EARTH_R  = 6371000; // metres
 
+    function stationWeight(station) {
+        const value = Number(station.quality_score ?? station.confidence);
+        return Number.isFinite(value) && value > 0 ? value : 1.0;
+    }
+
     /**
      * Convert a (lat, lon) to local ENU (East, North) metres
      * relative to a reference origin.
@@ -44,7 +49,7 @@ const Triangulation = (() => {
     /**
      * Core LS-AoA solver.
      *
-     * stations: Array of { lat, lon, bearing_deg, confidence }
+     * stations: Array of { lat, lon, bearing_deg, quality_score }
      *
      * Each bearing line can be written as:
      *   sin(theta) * (y - y_i) - cos(theta) * (x - x_i) = 0
@@ -69,7 +74,7 @@ const Triangulation = (() => {
         let AtWb = [0, 0];
 
         for (const st of stations) {
-            const w = st.confidence ?? 1.0;
+            const w = stationWeight(st);
             const { E, N } = latLonToENU(st.lat, st.lon, refLat, refLon);
 
             // Convert bearing (CW from N) to ENU math angle (CCW from E)
@@ -192,7 +197,7 @@ const Triangulation = (() => {
                     let diff = Math.abs(targetBearing - st.bearing_deg) % 360;
                     if (diff > 180) diff = 360 - diff;
 
-                    const weight = st.confidence ?? 1.0;
+                    const weight = stationWeight(st);
                     // Log-probability of Gaussian
                     logScore += weight * (-(diff * diff) / (2 * SIGMA * SIGMA));
                 }
@@ -335,7 +340,7 @@ const Triangulation = (() => {
      */
     function filterStations(stations, config) {
         if (!stations || stations.length < 1) return stations;
-        let filtered = [...stations];
+        let filtered = stations.filter(st => st?.usable_for_triangulation !== false);
 
         // 1A. Spatial Box Geofencing (AABB Raycasting)
         // config.aabb = { minLat, maxLat, minLon, maxLon }

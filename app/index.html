@@ -282,7 +282,7 @@
                                     <th>Time (UTC)</th>
                                     <th>Station</th>
                                     <th>Bearing (°)</th>
-                                    <th>Confidence</th>
+                                    <th>Quality</th>
                                     <th>Freq (MHz)</th>
                                 </tr>
                             </thead>
@@ -491,9 +491,9 @@
                                     <option value="midpoint">Midpoint (2-station only)</option>
                                 </select>
                             </label>
-                            <label class="setting-row" title="Observations with a confidence rating below this threshold will be visibly excluded from the UI and ignored entirely during the actual math.">
-                                <span class="setting-label">Min. Confidence Threshold</span>
-                                <input type="number" id="setting-min-conf" class="setting-input" value="0.5" min="0" max="1" step="0.05">
+                            <label class="setting-row" title="For new fusion data this is the minimum DoA PAPR in dB. Legacy waypoint confidence values continue to use the same control as a 0–1 fallback.">
+                                <span class="setting-label">Quality Threshold</span>
+                                <input type="number" id="setting-min-conf" class="setting-input" value="0.3" min="0" max="20" step="0.1">
                             </label>
                             <label class="setting-row" title="When enabled, clustered estimation hits are automatically resolved into a single weighted-centroid coordinate using inverse-residual weighting. The converged result appears at the top of the Estimation tab.">
                                 <span class="setting-label">Converge Estimation Results</span>
@@ -520,8 +520,8 @@
                                     <span class="slider"></span>
                                 </label>
                             </label>
-                            <label class="setting-row" title="Excludes bearings captured while the vehicle was banking/rolling steeply (over 15 degrees) as these severely disrupt antenna phase alignment.">
-                                <span class="setting-label">Strict Attitude Gating (Max 15° Roll)</span>
+                            <label class="setting-row" title="Applies the local 15 degree roll/pitch filter when the upstream fusion record did not already decide usability.">
+                                <span class="setting-label">Local Attitude Gating (Max 15°)</span>
                                 <label class="toggle-switch">
                                     <input type="checkbox" id="setting-filter-attitude" checked>
                                     <span class="slider"></span>

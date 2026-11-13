@@ -1,145 +1,102 @@
+const assert = require('assert');
 const fs = require('fs');
+const path = require('path');
 
-// Load the raw data
-const rawData = JSON.parse(fs.readFileSync('./data/bearings_20260313_154333.json', 'utf8'));
-const allObs = rawData.waypoint_sequence;
+const inputPath = process.argv[2] || path.join('data', 'mock_bearings.json');
+const rawText = fs.readFileSync(inputPath, 'utf8');
+const records = path.extname(inputPath).toLowerCase() === '.jsonl'
+    ? rawText.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+    : JSON.parse(rawText).waypoint_sequence;
 
-// Simulate the frontend filtering
-let validObs = allObs.filter(obs => (obs.confidence || 1) >= 0.5);
-validObs = validObs.slice(-30); // temporal filter
+function numberOrNull(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
 
-// Paste strictly the definitions from triangulation.js
+function normalize(record, index) {
+    const lat = numberOrNull(record.lat ?? record.lat_deg);
+    const lon = numberOrNull(record.lon ?? record.lon_deg);
+    const bearing = numberOrNull(record.bearing_deg ?? record.doa_deg);
+    assert.notStrictEqual(lat, null, `record ${index} is missing latitude`);
+    assert.notStrictEqual(lon, null, `record ${index} is missing longitude`);
+    assert.notStrictEqual(bearing, null, `record ${index} is missing bearing`);
+
+    const papr = numberOrNull(record.doa_papr_db ?? record.confidence_0_1);
+    const qualityScore = numberOrNull(
+        record.quality_score ?? record.spectrum_peakiness_0_1 ?? record.confidence
+    );
+    return {
+        lat,
+        lon,
+        bearing_deg: ((bearing % 360) + 360) % 360,
+        doa_papr_db: papr,
+        quality_score: qualityScore === null ? 1 : Math.max(0, Math.min(1, qualityScore)),
+        usable_for_triangulation: record.usable_for_triangulation !== false,
+    };
+}
+
+const normalized = records.map(normalize);
+const validObs = normalized
+    .filter(obs => obs.usable_for_triangulation)
+    .filter(obs => obs.doa_papr_db === null || obs.doa_papr_db >= 0.3)
+    .slice(-30);
+
+assert(validObs.length >= 2, 'not enough valid observations for triangulation');
+
 const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
-const EARTH_R  = 6371000;
+const EARTH_R = 6371000;
 
 function latLonToENU(lat, lon, refLat, refLon) {
     const dLat = (lat - refLat) * DEG2RAD;
     const dLon = (lon - refLon) * DEG2RAD;
-    const N = dLat * EARTH_R;
-    const E = dLon * EARTH_R * Math.cos(refLat * DEG2RAD);
-    return { E, N };
+    return {
+        E: dLon * EARTH_R * Math.cos(refLat * DEG2RAD),
+        N: dLat * EARTH_R,
+    };
 }
 
 function enuToLatLon(E, N, refLat, refLon) {
-    const lat = refLat + (N / EARTH_R) * RAD2DEG;
-    const lon = refLon + (E / (EARTH_R * Math.cos(refLat * DEG2RAD))) * RAD2DEG;
-    return { lat, lon };
+    return {
+        lat: refLat + (N / EARTH_R) * RAD2DEG,
+        lon: refLon + (E / (EARTH_R * Math.cos(refLat * DEG2RAD))) * RAD2DEG,
+    };
+}
+
+function weight(station) {
+    return station.quality_score > 0 ? station.quality_score : 1;
 }
 
 function lsAoA(stations) {
-    if (!stations || stations.length < 2) return null;
-    const refLat = stations.reduce((s, st) => s + st.lat, 0) / stations.length;
-    const refLon = stations.reduce((s, st) => s + st.lon, 0) / stations.length;
-    let AtWA = [[0,0],[0,0]], AtWb = [0, 0];
-    for (const st of stations) {
-        const w = st.confidence ?? 1.0;
-        const { E, N } = latLonToENU(st.lat, st.lon, refLat, refLon);
-        const theta = (90 - st.bearing_deg) * DEG2RAD;
-        const sinT = Math.sin(theta);
-        const cosT = Math.cos(theta);
-        const a = sinT, b = -cosT, c = sinT * E - cosT * N;
+    const refLat = stations.reduce((sum, station) => sum + station.lat, 0) / stations.length;
+    const refLon = stations.reduce((sum, station) => sum + station.lon, 0) / stations.length;
+    const AtWA = [[0, 0], [0, 0]];
+    const AtWb = [0, 0];
+
+    for (const station of stations) {
+        const { E, N } = latLonToENU(station.lat, station.lon, refLat, refLon);
+        const theta = (90 - station.bearing_deg) * DEG2RAD;
+        const a = Math.sin(theta);
+        const b = -Math.cos(theta);
+        const c = a * E - Math.cos(theta) * N;
+        const w = weight(station);
         AtWA[0][0] += w * a * a;
         AtWA[0][1] += w * a * b;
         AtWA[1][0] += w * b * a;
         AtWA[1][1] += w * b * b;
-        AtWb[0]    += w * a * c;
-        AtWb[1]    += w * b * c;
-    }
-    const det = AtWA[0][0] * AtWA[1][1] - AtWA[0][1] * AtWA[1][0];
-    if (Math.abs(det) < 1e-10) return null;
-    const x = (AtWb[0] * AtWA[1][1] - AtWb[1] * AtWA[0][1]) / det;
-    const y = (AtWA[0][0] * AtWb[1] - AtWA[1][0] * AtWb[0]) / det;
-    let totalResidual = 0;
-    for (const st of stations) {
-        const { E, N } = latLonToENU(st.lat, st.lon, refLat, refLon);
-        const theta = (90 - st.bearing_deg) * DEG2RAD;
-        const sinT = Math.sin(theta);
-        const cosT = Math.cos(theta);
-        totalResidual += Math.abs(sinT * (x - E) - cosT * (y - N));
-    }
-    return {
-        lat: enuToLatLon(x, y, refLat, refLon).lat,
-        lon: enuToLatLon(x, y, refLat, refLon).lon,
-        residual_m: totalResidual / stations.length,
-        stationsUsed: stations.length,
-    };
-}
-
-function bayesianGrid(stations) {
-    if (!stations || stations.length < 2) return null;
-
-    const lsResult = lsAoA(stations);
-    let refLat = lsResult ? lsResult.lat : stations.reduce((s, st) => s + st.lat, 0) / stations.length;
-    let refLon = lsResult ? lsResult.lon : stations.reduce((s, st) => s + st.lon, 0) / stations.length;
-
-    const GRID_SIZE_M = 15000;
-    const STEP_M = 100;
-    const HALF = GRID_SIZE_M / 2;
-    const SIGMA = 5.0;
-
-    let maxScore = -Infinity;
-    let bestE = 0, bestN = 0;
-    let heatPoints = [];
-
-    const enuStations = stations.map(st => ({
-        ...st,
-        enu: latLonToENU(st.lat, st.lon, refLat, refLon)
-    }));
-
-    for (let y = -HALF; y <= HALF; y += STEP_M) {
-        for (let x = -HALF; x <= HALF; x += STEP_M) {
-            let logScore = 0;
-            for (const st of enuStations) {
-                const dx = x - st.enu.E;
-                const dy = y - st.enu.N;
-                const mathAngle = Math.atan2(dy, dx) * RAD2DEG;
-                let targetBearing = 90 - mathAngle;
-                if (targetBearing < 0) targetBearing += 360;
-
-                let diff = Math.abs(targetBearing - st.bearing_deg) % 360;
-                if (diff > 180) diff = 360 - diff;
-
-                const weight = st.confidence ?? 1.0;
-                logScore += weight * (-(diff * diff) / (2 * SIGMA * SIGMA));
-            }
-
-            if (logScore > maxScore) {
-                maxScore = logScore;
-                bestE = x;
-                bestN = y;
-            }
-            heatPoints.push({ x, y, score: logScore });
-        }
+        AtWb[0] += w * a * c;
+        AtWb[1] += w * b * c;
     }
 
-    const visualGrid = heatPoints
-        .map(pt => {
-            pt.prob = Math.exp(pt.score - maxScore);
-            return pt;
-        })
-        .filter(pt => pt.prob > 0.1)
-        .map(pt => {
-            const ll = enuToLatLon(pt.x, pt.y, refLat, refLon);
-            return [ll.lat, ll.lon, pt.prob];
-        });
-
-    const resultLatLon = enuToLatLon(bestE, bestN, refLat, refLon);
-    return {
-        lat: resultLatLon.lat,
-        lon: resultLatLon.lon,
-        heatGrid: visualGrid
-    };
+    const determinant = AtWA[0][0] * AtWA[1][1] - AtWA[0][1] * AtWA[1][0];
+    assert(Math.abs(determinant) >= 1e-10, 'bearing matrix is singular');
+    const x = (AtWb[0] * AtWA[1][1] - AtWb[1] * AtWA[0][1]) / determinant;
+    const y = (AtWA[0][0] * AtWb[1] - AtWA[1][0] * AtWb[0]) / determinant;
+    const result = enuToLatLon(x, y, refLat, refLon);
+    assert(Number.isFinite(result.lat) && Number.isFinite(result.lon), 'invalid LS-AoA result');
+    return result;
 }
 
-try {
-    console.log("Running lsAoA...");
-    const base = lsAoA(validObs);
-    console.log("Success! lsAoA Result:", base ? "Valid" : "Null");
-    
-    console.log("Running bayesianGrid...");
-    const res = bayesianGrid(validObs);
-    console.log("Success! Grid size:", res.heatGrid.length);
-} catch(e) {
-    console.error("FATAL ERROR IN MATH:", e);
-}
+const result = lsAoA(validObs);
+console.log(`PASS: ${inputPath} (${records.length} records, ${validObs.length} used)`);
+console.log(`LS-AoA result: ${result.lat.toFixed(6)}, ${result.lon.toFixed(6)}`);

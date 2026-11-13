@@ -808,11 +808,24 @@ const MapView = (() => {
 
             _drawnObsIds.add(obs.id);
 
-            // KrakenSDR confidence-based path colors
-            const conf = obs.confidence ?? 0;
+            // Use the normalized solver score for color, but display the raw
+            // PAPR metric separately when it is available.
+            const scoreValue = Number(obs.quality_score ?? obs.confidence);
+            const score = Number.isFinite(scoreValue) ? Math.max(0, Math.min(1, scoreValue)) : 1;
             let dotColor = '#e74c3c'; // Red
-            if (conf >= 0.7) dotColor = '#2ecc71'; // Green
-            else if (conf >= 0.4) dotColor = '#f1c40f'; // Yellow
+            if (score >= 0.7) dotColor = '#2ecc71'; // Green
+            else if (score >= 0.4) dotColor = '#f1c40f'; // Yellow
+
+            const papr = Number(obs.doa_papr_db);
+            const qualityText = Number.isFinite(papr)
+                ? `${papr.toFixed(2)} dB PAPR`
+                : Number.isFinite(scoreValue)
+                    ? `${(score * 100).toFixed(0)}% ${obs.quality_kind === 'legacy_confidence' ? 'legacy' : 'score'}`
+                    : '—';
+            const usableText = obs.usable_for_triangulation === false ? 'NO' : 'YES';
+            const obsFreqMHz = obs.frequency_hz
+                ? (obs.frequency_hz / 1e6).toFixed(4)
+                : freqMHz;
 
             const cMarker = L.circleMarker([obs.lat, obs.lon], {
                 radius: 4, fillColor: dotColor, color: '#000', weight: 1, fillOpacity: 1
@@ -823,8 +836,9 @@ const MapView = (() => {
                 <b>Log Number: ${index + 1}</b><br>
                 RDF Bearing: ${obs.bearing_deg.toFixed(1)}&deg;<br>
                 Vehicle Heading: ${(obs.heading_used_deg || 0).toFixed(1)}&deg;<br>
-                Confidence: ${(conf * 100).toFixed(0)}%<br>
-                Frequency: ${freqMHz} MHz
+                Quality: ${qualityText}<br>
+                Upstream usable: ${usableText}<br>
+                Frequency: ${obsFreqMHz} MHz
             `, { autoClose: false, closeOnClick: false });
             _obsLayer.addLayer(cMarker);
 

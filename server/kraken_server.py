@@ -17,6 +17,7 @@ Usage:
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -59,6 +60,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Valid file extensions for replay data
 VALID_REPLAY_EXTS = {".json", ".jsonl"}
+MAX_LIVE_HISTORY = int(os.environ.get("MAX_LIVE_HISTORY", "1000"))
+DEFAULT_FREQUENCY_HZ = 462637500
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -93,18 +96,181 @@ MAVLINK_UPSTREAM_PORT = int(os.environ.get("MAVLINK_UPSTREAM_PORT", 14551))
 _mav_upstream = None        # Set at startup
 _mav_upstream_ready = False # True once we've received at least one packet
 
+
+def _finite_number(value):
+    """Return a finite float, or None for missing/invalid input."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _clamp01(value):
+    value = _finite_number(value)
+    if value is None:
+        return None
+    return max(0.0, min(1.0, value))
+
+
+def _as_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _looks_like_raw_kraken_record(record):
+    """Raw Kraken logger rows do not contain the UAV telemetry sequence."""
+    return (
+        "telemetry_seq" not in record
+        and "lat" not in record
+        and (
+            "source_timestamp_ms" in record
+            or "kraken_counter" in record
+            or "vfo_index" in record
+        )
+    )
+
+
+def _normalize_observation(record, index=0, source_hint="fusion"):
+    """Convert supported input records into the browser's canonical shape.
+
+    The new logger calls its raw signal-quality value ``doa_papr_db``. Older
+    fusion logs called the same kind of raw value ``confidence_0_1`` even
+    though it is not guaranteed to be in the 0..1 range. Native waypoint JSON
+    is the only format where ``confidence`` is treated as a normalized weight.
+    """
+    if not isinstance(record, dict) or _looks_like_raw_kraken_record(record):
+        return None
+
+    lat = record.get("lat")
+    if lat is None:
+        lat = record.get("lat_deg")
+    lon = record.get("lon")
+    if lon is None:
+        lon = record.get("lon_deg")
+    bearing = record.get("bearing_deg")
+    if bearing is None:
+        bearing = record.get("doa_deg")
+
+    lat = _finite_number(lat)
+    lon = _finite_number(lon)
+    bearing = _finite_number(bearing)
+    if lat is None or lon is None or bearing is None:
+        return None
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        return None
+
+    run_id = record.get("run_id")
+    kraken_seq = record.get("kraken_seq")
+    telemetry_seq = record.get("telemetry_seq")
+    record_id = record.get("id")
+    if not record_id:
+        identity = [str(value) for value in (run_id, kraken_seq, telemetry_seq) if value is not None]
+        record_id = ":".join(identity) if identity else f"replay_{index:05d}"
+
+    if record.get("doa_papr_db") is not None or record.get("spectrum_parse_valid") is not None:
+        source_schema = "fusion_v2"
+    elif "confidence_0_1" in record and (kraken_seq is not None or source_hint != "waypoint"):
+        source_schema = "fusion_legacy"
+    elif source_hint == "waypoint" or "confidence" in record:
+        source_schema = "waypoint"
+    else:
+        source_schema = source_hint
+
+    papr = _finite_number(record.get("doa_papr_db"))
+    legacy_metric = _finite_number(record.get("confidence_0_1"))
+    quality_score = _clamp01(record.get("quality_score"))
+    quality_kind = record.get("quality_kind")
+
+    if papr is not None:
+        quality_kind = quality_kind or "papr_db"
+    elif legacy_metric is not None and source_schema != "waypoint":
+        # The upstream fusion logger intentionally accepts this legacy field
+        # as an alias for the raw PAPR metric.
+        papr = legacy_metric
+        quality_kind = quality_kind or "legacy_papr_db"
+    elif quality_score is None:
+        legacy_confidence = _clamp01(record.get("confidence"))
+        if legacy_confidence is not None:
+            quality_score = legacy_confidence
+            quality_kind = quality_kind or "legacy_confidence"
+
+    if quality_score is None:
+        # Peakiness is already a bounded 0..1 concentration measure. It is a
+        # solver weight only, never a replacement for the raw PAPR metric.
+        quality_score = _clamp01(record.get("spectrum_peakiness_0_1"))
+
+    normalized = {
+        "id": str(record_id),
+        "label": record.get("label") or f"Replay #{index} | seq={kraken_seq if kraken_seq is not None else index}",
+        "lat": lat,
+        "lon": lon,
+        "bearing_deg": bearing % 360.0,
+        "source_schema": source_schema,
+        "quality_kind": quality_kind or "unknown",
+        "usable_for_triangulation": _as_bool(record.get("usable_for_triangulation"), True),
+        "received_at": record.get("received_at") or _now_iso(),
+    }
+
+    if quality_score is not None:
+        normalized["quality_score"] = quality_score
+    if papr is not None:
+        normalized["doa_papr_db"] = papr
+    if legacy_metric is not None:
+        normalized["legacy_confidence_0_1"] = legacy_metric
+    if "confidence" in record and source_schema == "waypoint":
+        normalized["confidence"] = _clamp01(record.get("confidence"))
+
+    numeric_fields = {
+        "t_rx_ms", "source_timestamp_ms", "dt_ms", "frequency_hz", "vfo_index",
+        "raw_field_count", "rssi_power_db", "kraken_latency_ms",
+        "kraken_lat_deg", "kraken_lon_deg", "gps_heading_deg", "compass_heading_deg",
+        "spectrum_peak_unit_deg", "spectrum_peak_compass_deg", "peak_width_deg",
+        "peak_to_second_peak_db", "spectrum_entropy_0_1", "spectrum_peakiness_0_1",
+        "temporal_sample_count", "temporal_stability_0_1", "temporal_jitter_deg",
+        "altitude_rel_ft", "yaw_deg", "pitch_deg", "roll_deg", "ground_speed_ft_s",
+        "vel_north_m_s", "vel_east_m_s", "vel_down_m_s",
+    }
+    copied_fields = {
+        "run_id", "kraken_seq", "telemetry_seq", "t_rx_ms", "source_timestamp_ms", "dt_ms",
+        "frequency_hz", "vfo_index", "raw_field_count", "doa_angle_convention",
+        "spectrum_angle_convention",
+        "rssi_power_db", "antenna_array_arrangement", "kraken_latency_ms",
+        "kraken_station_id", "kraken_lat_deg", "kraken_lon_deg", "gps_heading_deg",
+        "compass_heading_deg", "heading_sensor", "spectrum_peak_unit_deg",
+        "spectrum_peak_compass_deg", "peak_width_deg", "peak_to_second_peak_db",
+        "spectrum_entropy_0_1", "spectrum_peakiness_0_1", "spectrum_parse_valid",
+        "temporal_sample_count", "temporal_stability_0_1", "temporal_jitter_deg",
+        "altitude_rel_ft", "yaw_deg", "pitch_deg", "roll_deg", "ground_speed_ft_s",
+        "vel_north_m_s", "vel_east_m_s", "vel_down_m_s", "heading_used_deg",
+    }
+    for field in copied_fields:
+        if field not in record or record[field] is None:
+            continue
+        normalized[field] = _finite_number(record[field]) if field in numeric_fields else record[field]
+
+    if "heading_used_deg" not in normalized:
+        heading = normalized.get("yaw_deg")
+        if heading is None:
+            heading = normalized.get("compass_heading_deg")
+        if heading is None:
+            heading = normalized.get("gps_heading_deg")
+        if heading is not None:
+            normalized["heading_used_deg"] = heading
+
+    return normalized
+
 def _load_mock():
-    global _mock_data, _waypoints, _obs_index, _last_advance_t, _obs_timestamps
-    with open(MOCK_DATA_PATH, encoding='utf-8') as f:
-        _mock_data = json.load(f)
-    _waypoints = _mock_data.get("waypoint_sequence", [])
-    _obs_index = 1
-    _last_advance_t = time.time()
-    _obs_timestamps = {}
-    # Stamp the first waypoint immediately
-    if _waypoints:
-        _obs_timestamps[_waypoints[0]['id']] = _now_iso()
-    logger.info(f"Loaded {len(_waypoints)} waypoints from mock data.")
+    _load_mock_from_path(str(MOCK_DATA_PATH))
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -131,11 +297,15 @@ def _advance_waypoint():
 
 def _build_response():
     if _live_mode:
+        live_frequency = (_live_current or {}).get("frequency_hz") if _live_current else None
+        if live_frequency is None and _mock_data:
+            live_frequency = _mock_data.get("frequency_hz")
         return {
             "source":              "udp_stream",
-            "frequency_hz":        _mock_data.get("frequency_hz", 462637500) if _mock_data else 462637500,
+            "frequency_hz":        live_frequency or DEFAULT_FREQUENCY_HZ,
             "mode":                "live_telemetry",
             "doa_method":          _mock_data.get("doa_method", "MUSIC") if _mock_data else "MUSIC",
+            "source_schema":       (_live_current or {}).get("source_schema", "unknown") if _live_current else "unknown",
             "current_observation": _live_current,
             "observation_history": _live_history,
             "expected_target":     _mock_data.get("expected_target") if _mock_data else None,
@@ -145,9 +315,10 @@ def _build_response():
     if not _waypoints:
         return {
             "source":              "replay",
-            "frequency_hz":        462637500,
+            "frequency_hz":        DEFAULT_FREQUENCY_HZ,
             "mode":                "replay",
             "doa_method":          "MUSIC",
+            "source_schema":       "unknown",
             "current_observation": None,
             "observation_history": [],
             "expected_target":     None,
@@ -165,9 +336,10 @@ def _build_response():
     current = enriched[-1] if enriched else None
     return {
         "source":              "replay",
-        "frequency_hz":        _mock_data.get("frequency_hz", 462637500) if _mock_data else 462637500,
+        "frequency_hz":        _mock_data.get("frequency_hz", DEFAULT_FREQUENCY_HZ) if _mock_data else DEFAULT_FREQUENCY_HZ,
         "mode":                _mock_data.get("mode", "single_mobile_kraken") if _mock_data else "replay",
         "doa_method":          _mock_data.get("doa_method", "MUSIC") if _mock_data else "MUSIC",
+        "source_schema":       _mock_data.get("source_schema", "unknown") if _mock_data else "unknown",
         "current_observation": current,
         "observation_history": enriched,
         "expected_target":     _mock_data.get("expected_target") if _mock_data else None,
@@ -329,36 +501,56 @@ def upload_replay_file():
     return jsonify({"status": "ok", "name": f.filename, "size_kb": round(dest.stat().st_size / 1024, 1)})
 
 def _load_replay_jsonl(path):
-    """Load a fusion JSONL log and convert records to waypoint_sequence format."""
+    """Load a supported JSONL log and normalize records for the web app."""
     global _mock_data, _waypoints, _obs_index, _last_advance_t, _obs_timestamps
     waypoints = []
+    schema_counts = {}
+    records_read = 0
+    records_rejected = 0
     with open(path, encoding='utf-8') as fh:
         for idx, line in enumerate(fh):
             line = line.strip()
             if not line:
                 continue
+            records_read += 1
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                records_rejected += 1
                 continue
-            # Build a waypoint from the fusion record
-            wp = {
-                "id":          f"replay_{idx:05d}",
-                "label":       f"Replay #{idx} | seq={rec.get('kraken_seq', idx)}",
-                "lat":         rec.get("lat_deg", 0),
-                "lon":         rec.get("lon_deg", 0),
-                "bearing_deg": rec.get("doa_deg", 0),
-                "confidence":  rec.get("confidence_0_1", 0.5),
-            }
-            # Carry forward extra telemetry fields for filtering
-            for key in ("roll_deg", "pitch_deg", "yaw_deg", "ground_speed_ft_s", "altitude_rel_ft"):
-                if key in rec:
-                    wp[key] = rec[key]
+            wp = _normalize_observation(rec, idx, source_hint="fusion")
+            if wp is None:
+                records_rejected += 1
+                continue
+            schema_counts[wp["source_schema"]] = schema_counts.get(wp["source_schema"], 0) + 1
             waypoints.append(wp)
+
+    if not waypoints:
+        raise ValueError(
+            "No usable fused observations found. Raw Kraken JSONL must be fused "
+            "with UAV telemetry before replay."
+        )
+
+    schemas = sorted(schema_counts)
+    source_schema = schemas[0] if len(schemas) == 1 else "mixed"
+    frequency = next(
+        (wp.get("frequency_hz") for wp in waypoints if wp.get("frequency_hz")),
+        DEFAULT_FREQUENCY_HZ,
+    )
+    stats = {
+        "records_read": records_read,
+        "records_loaded": len(waypoints),
+        "records_rejected": records_rejected,
+        "usable_records": sum(1 for wp in waypoints if wp.get("usable_for_triangulation", True)),
+        "schemas": schema_counts,
+        "source_schema": source_schema,
+    }
     _mock_data = {
-        "frequency_hz": 462637500,
+        "frequency_hz": frequency,
         "mode": "replay",
         "doa_method": "MUSIC",
+        "source_schema": source_schema,
+        "replay_stats": stats,
         "waypoint_sequence": waypoints,
     }
     _waypoints = waypoints
@@ -367,7 +559,11 @@ def _load_replay_jsonl(path):
     _obs_timestamps = {}
     if _waypoints:
         _obs_timestamps[_waypoints[0]['id']] = _now_iso()
-    logger.info(f"Loaded {len(_waypoints)} waypoints from JSONL replay: {Path(path).name}")
+    logger.info(
+        "Loaded %s observations from JSONL replay: %s (schema=%s, rejected=%s)",
+        len(_waypoints), Path(path).name, source_schema, records_rejected,
+    )
+    return stats
 
 @app.route("/api/replay/load", methods=["POST"])
 def load_replay():
@@ -387,23 +583,42 @@ def load_replay():
     if p.suffix.lower() not in VALID_REPLAY_EXTS:
         return jsonify({"error": f"Invalid file type"}), 400
 
+    replay_stats = None
     with _lock:
         _live_mode = False
         _paused = True
         _speed = 1.0
         if p.suffix.lower() == '.jsonl':
-            _load_replay_jsonl(str(p))
+            try:
+                replay_stats = _load_replay_jsonl(str(p))
+            except ValueError as exc:
+                _live_mode = True
+                _paused = False
+                return jsonify({"error": str(exc)}), 400
         else:
             _load_mock_from_path(str(p))
     logger.info(f"REPLAY MODE — Loaded {len(_waypoints)} waypoints from {p.name}")
-    return jsonify({"status": "ok", "total": len(_waypoints), "filename": p.name})
+    return jsonify({
+        "status": "ok",
+        "total": len(_waypoints),
+        "filename": p.name,
+        "source_schema": _mock_data.get("source_schema", "waypoint") if _mock_data else "unknown",
+        "stats": replay_stats or {},
+    })
 
 def _load_mock_from_path(path):
     """Load a bearings JSON file (original format)."""
     global _mock_data, _waypoints, _obs_index, _last_advance_t, _obs_timestamps
     with open(path, encoding='utf-8') as fh:
         _mock_data = json.load(fh)
-    _waypoints = _mock_data.get("waypoint_sequence", [])
+    normalized = []
+    for idx, record in enumerate(_mock_data.get("waypoint_sequence", [])):
+        waypoint = _normalize_observation(record, idx, source_hint="waypoint")
+        if waypoint is not None:
+            normalized.append(waypoint)
+    _waypoints = normalized
+    _mock_data["waypoint_sequence"] = _waypoints
+    _mock_data["source_schema"] = "waypoint"
     _obs_index = 1
     _last_advance_t = time.time()
     _obs_timestamps = {}
@@ -479,30 +694,12 @@ def transmit():
 # ── Entry Point ────────────────────────────────────────────────────────────────
 
 def _translate_fusion_record(payload):
-    """Auto-detect and translate MRA Software Team fusion records to Kraken schema."""
-    if "kraken_seq" not in payload:
-        return payload
-
-    if not payload.get("usable_for_triangulation", True):
+    """Normalize fusion or native waypoint payloads received over UDP."""
+    if not isinstance(payload, dict):
         return None
-
-    seq = payload["kraken_seq"]
-    ts_ms = payload.get("t_gcs_rx_ms", int(time.time() * 1000))
-
-    translated = {
-        "id":          f"fusion_{seq}",
-        "label":       f"Fusion #{seq}",
-        "lat":         payload["lat_deg"],
-        "lon":         payload["lon_deg"],
-        "bearing_deg": payload["doa_deg"],
-        "confidence":  payload.get("confidence_0_1", 0.5),
-        "received_at": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat(timespec='seconds'),
-        "fusion_meta": {
-            "kraken_seq": seq,
-            "usable": payload.get("usable_for_triangulation", True),
-        },
-    }
-    return translated
+    if "kraken_seq" not in payload and not {"lat", "lon", "bearing_deg"}.issubset(payload):
+        return payload
+    return _normalize_observation(payload, payload.get("kraken_seq", 0), source_hint="udp_fusion")
 
 def udp_listener_thread():
     global _live_mode, _live_history, _live_current
@@ -526,6 +723,8 @@ def udp_listener_thread():
             with _lock:
                 _live_mode = True
                 _live_history.append(payload)
+                if len(_live_history) > MAX_LIVE_HISTORY:
+                    del _live_history[:-MAX_LIVE_HISTORY]
                 _live_current = payload
         except Exception as e:
             logger.error(f"UDP parse error: {e}")

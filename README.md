@@ -35,7 +35,7 @@ pip install -r requirements.txt
 ```
 
 ### 3. Start the Application Server
-Run the Python backend server. By default, it will automatically load a dense, pre-recorded mock dataset (`data/bearings_20260313_154333.json`) so you can test the triangulation math immediately.
+Run the Python backend server. It starts in live UDP mode and listens for fused observations on UDP port 5051.
 ```bash
 python server/kraken_server.py
 ```
@@ -68,6 +68,16 @@ kraken-triangulator/
         ├── triangulation.js   # Core LS-AoA / Bayesian solvers & Spatial Filtering
         └── data_feed.js       # Asynchronous data polling from the Python backend
 ```
+
+---
+
+## Supported Input Formats
+
+The app accepts native waypoint JSON and fused JSONL records. New fused records use `doa_deg` as an already-converted compass bearing and `doa_papr_db` as a raw peak-sharpness value. PAPR is measured in dB and is not a 0–1 probability.
+
+The replay adapter also accepts older fusion logs that use `confidence_0_1`. Those values are treated as a legacy raw quality metric, not blindly displayed as a percentage. `usable_for_triangulation` is honored when present, and spectrum metrics are preserved for display and weighting.
+
+Raw Kraken logger JSONL does not contain the UAV telemetry position needed for triangulation. Fuse it with telemetry first, or load the resulting fusion JSONL instead.
 
 ---
 

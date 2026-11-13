@@ -643,6 +643,49 @@
     let _logCounter = 0;
     let _loggedIds  = new Set();
 
+    function _number(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function _qualityScore(obs) {
+        const explicit = _number(obs?.quality_score);
+        if (explicit !== null) return Math.max(0, Math.min(1, explicit));
+        const legacy = _number(obs?.confidence);
+        if (legacy !== null) return Math.max(0, Math.min(1, legacy));
+        return 1.0;
+    }
+
+    function _qualityText(obs) {
+        const papr = _number(obs?.doa_papr_db);
+        if (papr !== null) return `${papr.toFixed(2)} dB PAPR`;
+        const score = _number(obs?.quality_score);
+        if (obs?.quality_kind === 'legacy_confidence' || obs?.confidence !== undefined) {
+            const legacy = _number(obs?.confidence ?? score);
+            if (legacy !== null) return `${(legacy * 100).toFixed(0)}% legacy`;
+        }
+        if (score !== null) return `${(score * 100).toFixed(0)}% score`;
+        return '—';
+    }
+
+    function _passesQuality(obs) {
+        if (obs?.usable_for_triangulation === false) return false;
+        const threshold = Math.max(0, _number(elMinConf?.value) ?? 0.3);
+        const papr = _number(obs?.doa_papr_db);
+        if (papr !== null) return papr >= threshold;
+
+        const legacy = _number(obs?.confidence ?? obs?.quality_score);
+        if (legacy !== null) return legacy >= Math.min(threshold, 1.0);
+        return true;
+    }
+
+    function _hasUpstreamUsabilityDecision(obs) {
+        return Boolean(
+            obs?.source_schema?.startsWith('fusion') &&
+            typeof obs.usable_for_triangulation === 'boolean'
+        );
+    }
+
     document.getElementById('log-clear-btn')?.addEventListener('click', () => {
         _logEntries = [];
         _logCounter = 0;
@@ -673,8 +716,11 @@
             addedAny = true;
             _logCounter++;
 
-            const conf = obs.confidence ?? 0;
-            const confClass = conf >= 0.8 ? 'conf-high' : conf >= 0.5 ? 'conf-med' : 'conf-low';
+            const score = _qualityScore(obs);
+            const qualityClass = score >= 0.8 ? 'conf-high' : score >= 0.5 ? 'conf-med' : 'conf-low';
+            const quality = obs.usable_for_triangulation === false
+                ? `REJECTED · ${_qualityText(obs)}`
+                : _qualityText(obs);
             // Use server-assigned system-clock time (received_at)
             const time = obs.received_at
                 ? new Date(obs.received_at).toLocaleTimeString()
@@ -686,14 +732,19 @@
                 <td>${time}</td>
                 <td>${obs.label || obs.id}</td>
                 <td>${obs.bearing_deg.toFixed(1)}&deg;</td>
-                <td class="${confClass}">${(conf * 100).toFixed(0)}%</td>
+                <td class="${qualityClass}">${quality}</td>
                 <td>${freqMHz}</td>
             `;
             if (placeholder) placeholder.remove();
             tbody.appendChild(row);
             _logEntries.push({
                 n: _logCounter, time, id: obs.id,
-                bearing_deg: obs.bearing_deg, confidence: conf,
+                bearing_deg: obs.bearing_deg,
+                confidence: obs.confidence,
+                quality_score: obs.quality_score,
+                quality_kind: obs.quality_kind,
+                doa_papr_db: obs.doa_papr_db,
+                usable_for_triangulation: obs.usable_for_triangulation,
                 lat: obs.lat, lon: obs.lon, freq_hz: data.frequency_hz,
             });
         });
@@ -800,13 +851,12 @@
         }
 
         let history = data?.observation_history ?? [];
-        const minConf = parseFloat(elMinConf?.value ?? 0.5);
-        
-        // 1. Initial manual pruning (Confidence, Attitude, Temporal)
-        let filtered = history.filter(obs => (obs.confidence ?? 1) >= minConf);
+        // 1. Initial manual pruning (Quality, Attitude, Temporal)
+        let filtered = history.filter(_passesQuality);
         
         if (elFilterAttitude?.checked) {
             filtered = filtered.filter(obs => {
+                if (_hasUpstreamUsabilityDecision(obs)) return true;
                 const roll = Math.abs(obs.roll_deg || 0);
                 const pitch = Math.abs(obs.pitch_deg || 0);
                 return roll <= 15.0 && pitch <= 15.0;
@@ -856,8 +906,8 @@
             if (algo === 'bayesian' && result.heatGrid) {
                 MapView.setHeatGrid(result.heatGrid);
             } else {
-                const avgConf   = validObs.reduce((s, o) => s + (o.confidence ?? 1), 0) / validObs.length;
-                const intensity = Math.min(1.0, (validObs.length / 6) * avgConf);
+                const avgQuality = validObs.reduce((s, o) => s + _qualityScore(o), 0) / validObs.length;
+                const intensity = Math.min(1.0, (validObs.length / 6) * avgQuality);
                 MapView.addHeatPoint(result.lat, result.lon, intensity);
             }
             const el = document.getElementById('hm-point-count');
